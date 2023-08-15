@@ -75,7 +75,7 @@ else:
     xrange = range
     import collections.abc as collections_abc
 
-version = 0, 99, 3, 1
+version = 0, 99, 3
 
 NoneType = type(None)
 
@@ -3096,8 +3096,14 @@ class Record(object):
         if record._data[0] == NULL:
             record._data[0] = SPACE
         if record._data[0] not in (SPACE, ASTERISK):
-            # TODO: log warning instead
-            raise DbfError("record data not correct -- first character should be a ' ' or a '*'.")
+            # Create error log to write erroneous records to
+            with open('error.log', 'a') as f:
+                now = datetime.datetime.now()
+                f.write('\n')
+                f.write(now.strftime("%Y-%m-%d %H:%M:%S"))
+                f.write("\tError with record: " + str(record[0]))
+                f.write("\t Expected character SPACE or ASTERISK, instead found: " + str(record._data[0]))
+            pass
         if not _fromdisk and layout.location == ON_DISK:
             record._update_disk()
         return record
@@ -4142,12 +4148,16 @@ def retrieve_character(bytes, fielddef, memo, decoder):
     data = to_bytes(bytes)
     if fielddef[FLAGS] & BINARY:
         return data
-    data = fielddef[CLASS](decoder(data)[0])
-    if not data.strip():
-        cls = fielddef[EMPTY]
-        if cls is NoneType:
-            return None
-        return cls(data)
+    try:
+        data = fielddef[CLASS](decoder(data)[0])
+        if not data.strip():
+            cls = fielddef[EMPTY]
+            if cls is NoneType:
+                return None
+            return cls(data)
+    except:
+        data=''
+
     return data
 
 def update_character(string, fielddef, memo, decoder, encoder):
@@ -4197,9 +4207,16 @@ def retrieve_date(bytes, fielddef, *ignore):
         if cls is NoneType:
             return None
         return cls()
-    year = int(text[0:4])
-    month = int(text[4:6])
-    day = int(text[6:8])
+    try:
+        year = int(text[0:4])
+        month = int(text[4:6])
+        day = int(text[6:8])
+    except:
+        cls = fielddef[EMPTY]
+        if cls is NoneType:
+            return None
+        return cls()
+
     return fielddef[CLASS](year, month, day)
 
 def update_date(moment, *ignore):
@@ -5706,15 +5723,16 @@ class Table(_Navigation):
         else:
             version = 'unknown - ' + hex(self._meta.header.version)
         str =  """
-        Table:         %s
-        Type:          %s
-        Codepage:      %s [%s]
-        Status:        %s
-        Last updated:  %s
-        Record count:  %d
-        Field count:   %d
-        Record length: %d """ % (self.filename, version,
-            self.codepage, encoder, status,
+        Table:           %s
+        Type:            %s
+        Listed Codepage: %s
+        Used Codepage:   %s
+        Status:          %s
+        Last updated:    %s
+        Record count:    %d
+        Field count:     %d
+        Record length:   %d """ % (self.filename, version,
+            code_pages[self._meta.header.codepage()][1], self.codepage, status,
             self.last_update, len(self), self.field_count, self.record_length)
         str += "\n        --Fields--\n"
         for i in range(len(self.field_names)):
@@ -5726,7 +5744,7 @@ class Table(_Navigation):
         """
         code page used for text translation
         """
-        return CodePage(code_pages[self._meta.header.codepage()][0])
+        return CodePage(self._meta.codepage)
 
     @codepage.setter
     def codepage(self, codepage):
@@ -6344,7 +6362,11 @@ class Table(_Navigation):
         meta = self._meta
         if meta.status != READ_WRITE:
             raise DbfError('%s not in read/write mode, unable to change field size' % meta.filename)
-        if not 0 < new_size < 256:
+        if self._versionabbr == 'clp':
+            max_size = 65535
+        else:
+            max_size = 255
+        if not 0 < new_size <= max_size:
             raise DbfError("new_size must be between 1 and 255 (use delete_fields to remove a field)")
         chosen = self._list_fields(chosen)
         for candidate in chosen:
@@ -6748,8 +6770,6 @@ class ClpTable(Db3Table):
             old_fields[name]['type'] = meta[name][TYPE]
             old_fields[name]['empty'] = meta[name][EMPTY]
             old_fields[name]['class'] = meta[name][CLASS]
-        meta.fields[:] = []
-        offset = 1
         fieldsdef = meta.header.fields
         if len(fieldsdef) % 32 != 0:
             raise BadDataError(
@@ -6761,43 +6781,57 @@ class ClpTable(Db3Table):
                         % (meta.header.field_count, len(fieldsdef) // 32))
         total_length = meta.header.record_length
         nulls_found = False
-        for i in range(meta.header.field_count):
-            fieldblock = fieldsdef[i*32:(i+1)*32]
-            name = self._meta.decoder(unpack_str(fieldblock[:11]))[0]
-            type = fieldblock[11]
-            if not type in meta.fieldtypes:
-                raise BadDataError("Unknown field type: %s" % type)
-            start = unpack_long_int(fieldblock[12:16])
-            length = fieldblock[16]
-            decimals = fieldblock[17]
-            if type == CHAR:
-                length += decimals * 256
-            offset += length
-            end = start + length
-            flags = fieldblock[18]
-            null = flags & NULLABLE
-            if null:
-                nulls_found = True
-            if name in meta.fields:
-                raise BadDataError('Duplicate field name found: %s' % name)
-            meta.fields.append(name)
-            if name in old_fields and old_fields[name]['type'] == type:
-                cls = old_fields[name]['class']
-                empty = old_fields[name]['empty']
+        starters = set()  # keep track of starting values in case header is poorly created
+        for starter in ('header', 'offset'):
+            meta.fields[:] = []
+            offset = 1
+            for i in range(meta.header.field_count):
+                fieldblock = fieldsdef[i*32:(i+1)*32]
+                name = self._meta.decoder(unpack_str(fieldblock[:11]))[0]
+                type = fieldblock[11]
+                if not type in meta.fieldtypes:
+                    raise BadDataError("Unknown field type: %s" % type)
+                if starter == 'header':
+                    start = unpack_long_int(fieldblock[12:16])
+                    if start in starters:
+                        # poor header
+                        break
+                    starters.add(start)
+                else:
+                    start = offset
+                length = fieldblock[16]
+                decimals = fieldblock[17]
+                if type == CHAR:
+                    length += decimals * 256
+                end = start + length
+                offset += length
+                flags = fieldblock[18]
+                null = flags & NULLABLE
+                if null:
+                    nulls_found = True
+                if name in meta.fields:
+                    raise BadDataError('Duplicate field name found: %s' % name)
+                meta.fields.append(name)
+                if name in old_fields and old_fields[name]['type'] == type:
+                    cls = old_fields[name]['class']
+                    empty = old_fields[name]['empty']
+                else:
+                    cls = meta.fieldtypes[type]['Class']
+                    empty = meta.fieldtypes[type]['Empty']
+                meta[name] = (
+                        type,
+                        start,
+                        length,
+                        end,
+                        decimals,
+                        flags,
+                        cls,
+                        empty,
+                        null
+                        )
             else:
-                cls = meta.fieldtypes[type]['Class']
-                empty = meta.fieldtypes[type]['Empty']
-            meta[name] = (
-                    type,
-                    start,
-                    length,
-                    end,
-                    decimals,
-                    flags,
-                    cls,
-                    empty,
-                    null
-                    )
+                # made it through all the fields
+                break
         if offset != total_length:
             raise BadDataError(
                     "Header shows record length of %d, but calculated record length is %d"
@@ -8741,18 +8775,28 @@ def export(table_or_records, filename=None, field_names=None, format='csv', head
         filename = base + "." + format
     with codecs.open(filename, 'w', encoding=encoding) as fd:
         if format == 'csv':
-            csvfile = csv.writer(fd, dialect=dialect)
-            if header:
-                csvfile.writerow(header_names)
+            if header is True:
+                fd.write(','.join(header_names))
+                fd.write('\n')
+            elif header:
+                fd.write(','.join(header))
+                fd.write('\n')
             for record in table_or_records:
                 fields = []
                 for fieldname in field_names:
                     data = record[fieldname]
+                    if isinstance(data, basestring) and data:
+                        data = '"%s"' % data.replace('"','""')
+                    elif data is None:
+                        data = ''
                     fields.append(unicode(data))
-                csvfile.writerow(fields)
+                fd.write(','.join(fields))
+                fd.write('\n')
         elif format == 'tab':
-            if header:
+            if header is True:
                 fd.write('\t'.join(header_names) + '\n')
+            elif header:
+                fd.write(','.join(header))
             for record in table_or_records:
                 fields = []
                 for fieldname in field_names:
@@ -8760,15 +8804,30 @@ def export(table_or_records, filename=None, field_names=None, format='csv', head
                     fields.append(unicode(data))
                 fd.write('\t'.join(fields) + '\n')
         else: # format == 'fixed'
-            with codecs.open("%s_layout.txt" % os.path.splitext(filename)[0], 'w', encoding=encoding) as header:
-                header.write("%-15s  Size\n" % "Field Name")
-                header.write("%-15s  ----\n" % ("-" * 15))
+            if header is True:
+                header = False  # don't need it
+            elif header:
+                # names to use as field names
+                header = list(header)   # in case header is an iterator
+            with codecs.open("%s_layout.txt" % os.path.splitext(filename)[0], 'w', encoding=encoding) as layout:
+                layout.write("%-15s  Size  Comment\n" % "Field Name")
+                layout.write("%-15s  ----  -------------------------\n" % ("-" * 15))
                 sizes = []
-                for field in field_names:
-                    size = table.field_info(field).length
+                for i, field in enumerate(field_names):
+                    info = table.field_info(field)
+                    if info.field_type == ord('D'):
+                        size = 10
+                    elif info.field_type in (ord('T'), ord('@')):
+                        size = 19
+                    else:
+                        size = info.length
                     sizes.append(size)
-                    header.write("%-15s  %3d\n" % (field, size))
-                header.write('\nTotal Records in file: %d\n' % len(table_or_records))
+                    comment = ''
+                    if header and i < len(header):
+                        # use overridden field name as comment
+                        comment = header[i]
+                    layout.write("%-15s  %4d  %s\n" % (field, size, comment))
+                layout.write('\nTotal Records in file: %d\n' % len(table_or_records))
             for record in table_or_records:
                 fields = []
                 for i, fieldname in enumerate(field_names):
